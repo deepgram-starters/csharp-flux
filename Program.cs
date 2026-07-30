@@ -18,6 +18,9 @@ using System.Collections.Concurrent;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
+using System.Text;
+using Deepgram;
+using Deepgram.Models.Flux.WebSocket;
 using Microsoft.IdentityModel.Tokens;
 using Tomlyn;
 using Tomlyn.Model;
@@ -36,8 +39,6 @@ DotNetEnv.Env.Load();
 var port = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 8081;
 var host = Environment.GetEnvironmentVariable("HOST") ?? "0.0.0.0";
 var frontendPort = int.TryParse(Environment.GetEnvironmentVariable("FRONTEND_PORT"), out var fp) ? fp : 8080;
-
-const string DeepgramFluxUrl = "wss://api.deepgram.com/v2/listen";
 
 // ============================================================================
 // SESSION AUTH - JWT tokens with rate limiting for production security
@@ -118,6 +119,9 @@ static string LoadApiKey()
 
 var apiKey = LoadApiKey();
 
+// Initialize the Deepgram library once at startup.
+Library.Initialize();
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -160,156 +164,142 @@ app.MapGet("/api/session", () =>
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Builds the Deepgram Flux WebSocket URL with query parameters forwarded from the client
-static string BuildDeepgramUrl(string? queryString)
+/// Builds a Deepgram FluxSchema from the query parameters forwarded by the client.
+/// These are the same parameters the raw proxy previously appended to the Deepgram URL.
+/// NOTE: The Flux WebSocket client is a PREVIEW feature of the Deepgram .NET SDK — its
+/// API surface may change in future releases.
+static FluxSchema BuildFluxSchema(string? queryString)
 {
-    var uri = new UriBuilder(DeepgramFluxUrl);
     var query = System.Web.HttpUtility.ParseQueryString(queryString ?? "");
 
-    // Flux uses a hardcoded model and minimal required parameters
-    var qs = System.Web.HttpUtility.ParseQueryString("");
-    qs["model"] = "flux-general-en";
-    qs["encoding"] = query["encoding"] ?? "linear16";
-    qs["sample_rate"] = query["sample_rate"] ?? "16000";
+    // Flux uses a hardcoded model and minimal required parameters.
+    var schema = new FluxSchema
+    {
+        Model = "flux-general-en",
+        Encoding = query["encoding"] ?? "linear16",
+        SampleRate = int.TryParse(query["sample_rate"], out var sr) ? sr : 16000,
+    };
 
-    // Optional flux-specific parameters (only add if provided)
-    if (!string.IsNullOrEmpty(query["eot_threshold"]))
-        qs["eot_threshold"] = query["eot_threshold"];
-    if (!string.IsNullOrEmpty(query["eager_eot_threshold"]))
-        qs["eager_eot_threshold"] = query["eager_eot_threshold"];
-    if (!string.IsNullOrEmpty(query["eot_timeout_ms"]))
-        qs["eot_timeout_ms"] = query["eot_timeout_ms"];
+    // Optional flux-specific parameters (only set if provided).
+    if (double.TryParse(query["eot_threshold"], out var eot))
+        schema.EotThreshold = eot;
+    if (double.TryParse(query["eager_eot_threshold"], out var eager))
+        schema.EagerEotThreshold = eager;
+    if (int.TryParse(query["eot_timeout_ms"], out var timeout))
+        schema.EotTimeoutMs = timeout;
 
-    // keyterm is a multi-value parameter
+    // keyterm is a multi-value parameter.
     var keyterms = query.GetValues("keyterm");
-    if (keyterms != null)
-    {
-        foreach (var term in keyterms)
-            qs.Add("keyterm", term);
-    }
+    if (keyterms is { Length: > 0 })
+        schema.Keyterm = keyterms.ToList();
 
-    uri.Query = qs.ToString();
-    return uri.ToString();
+    return schema;
 }
 
-/// Forwards messages from one WebSocket to another
-static async Task ForwardMessages(WebSocket source, WebSocket destination, string direction, CancellationToken ct)
-{
-    var buffer = new byte[8192];
-    var messageCount = 0;
-
-    try
-    {
-        while (source.State == WebSocketState.Open && destination.State == WebSocketState.Open)
-        {
-            var result = await source.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
-
-            if (result.MessageType == WebSocketMessageType.Close)
-            {
-                // Propagate close to destination
-                if (destination.State == WebSocketState.Open)
-                {
-                    await destination.CloseAsync(
-                        result.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
-                        result.CloseStatusDescription ?? "Connection closed",
-                        ct);
-                }
-                break;
-            }
-
-            messageCount++;
-            var logInterval = direction == "client→deepgram" ? 100 : 10;
-            var isBinary = result.MessageType == WebSocketMessageType.Binary;
-            if (messageCount % logInterval == 0 || !isBinary)
-            {
-                Console.WriteLine($"  {(direction == "client→deepgram" ? "→" : "←")} {direction} #{messageCount} (binary: {isBinary}, size: {result.Count})");
-            }
-
-            if (destination.State == WebSocketState.Open)
-            {
-                await destination.SendAsync(
-                    new ArraySegment<byte>(buffer, 0, result.Count),
-                    result.MessageType,
-                    result.EndOfMessage,
-                    ct);
-            }
-        }
-    }
-    catch (WebSocketException ex)
-    {
-        Console.Error.WriteLine($"  WebSocket error in {direction}: {ex.Message}");
-    }
-    catch (OperationCanceledException)
-    {
-        // Shutdown requested
-    }
-}
-
-/// Handles a single WebSocket proxy session between client and Deepgram Flux
+/// Handles a single session between a browser client and Deepgram Flux.
+///
+/// The browser-facing WebSocket is unchanged: the client still streams binary
+/// linear16 audio and receives Flux's native JSON messages ("Connected",
+/// "TurnInfo", "Error"). Only the Deepgram-facing side now uses the Deepgram .NET
+/// SDK (ClientFactory.CreateFluxWebSocketClient) instead of a raw ClientWebSocket.
+/// The SDK's typed response records serialize back to Flux's wire format via
+/// ToString(), so the frontend needs no changes.
+///
+/// PREVIEW: the Flux client is a preview feature of the SDK; its shape may change.
 async Task HandleFluxStream(WebSocket clientWs, string? queryString, string apiKey, CancellationToken appCt)
 {
     var connectionId = Guid.NewGuid().ToString("N")[..8];
     activeConnections[connectionId] = clientWs;
     Console.WriteLine($"[{connectionId}] Client connected to /api/flux");
 
-    var deepgramUrl = BuildDeepgramUrl(queryString);
-    Console.WriteLine($"[{connectionId}] Connecting to Deepgram Flux: {deepgramUrl}");
+    // Outbound queue → browser. SDK event handlers fire from the receive loop and may
+    // overlap, so all sends to the client WebSocket are funneled through one writer.
+    var outbound = System.Threading.Channels.Channel.CreateUnbounded<string>();
 
-    using var deepgramWs = new ClientWebSocket();
-    deepgramWs.Options.SetRequestHeader("Authorization", $"Token {apiKey}");
+    // Deepgram Flux client (replaces the raw ClientWebSocket).
+    var fluxClient = ClientFactory.CreateFluxWebSocketClient(apiKey);
+
+    // Forward each Flux event to the browser as the raw JSON the frontend expects.
+    await fluxClient.Subscribe(new EventHandler<ConnectedResponse>((_, e) => outbound.Writer.TryWrite(e.ToString())));
+    await fluxClient.Subscribe(new EventHandler<TurnInfoResponse>((_, e) => outbound.Writer.TryWrite(e.ToString())));
+    await fluxClient.Subscribe(new EventHandler<ErrorResponse>((_, e) => outbound.Writer.TryWrite(e.ToString())));
+
+    // Pump queued messages to the browser one at a time.
+    var pump = Task.Run(async () =>
+    {
+        try
+        {
+            await foreach (var msg in outbound.Reader.ReadAllAsync(appCt))
+            {
+                if (clientWs.State != WebSocketState.Open) break;
+                await clientWs.SendAsync(Encoding.UTF8.GetBytes(msg), WebSocketMessageType.Text, true, appCt);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (WebSocketException) { }
+    });
 
     try
     {
-        await deepgramWs.ConnectAsync(new Uri(deepgramUrl), appCt);
+        var schema = BuildFluxSchema(queryString);
+        Console.WriteLine($"[{connectionId}] Connecting to Deepgram Flux API...");
+
+        if (!await fluxClient.Connect(schema))
+        {
+            Console.Error.WriteLine($"[{connectionId}] Failed to connect to Deepgram Flux");
+            if (clientWs.State == WebSocketState.Open)
+            {
+                await clientWs.CloseAsync(
+                    WebSocketCloseStatus.InternalServerError,
+                    "Deepgram connection error",
+                    CancellationToken.None);
+            }
+            return;
+        }
         Console.WriteLine($"[{connectionId}] ✓ Connected to Deepgram Flux API");
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(appCt);
-
-        var clientToDeepgram = ForwardMessages(clientWs, deepgramWs, "client→deepgram", cts.Token);
-        var deepgramToClient = ForwardMessages(deepgramWs, clientWs, "deepgram→client", cts.Token);
-
-        // Wait for either direction to complete
-        await Task.WhenAny(clientToDeepgram, deepgramToClient);
-        cts.Cancel();
-
-        // Allow the other task to finish
-        try { await Task.WhenAll(clientToDeepgram, deepgramToClient); }
-        catch (OperationCanceledException) { }
-    }
-    catch (WebSocketException ex)
-    {
-        Console.Error.WriteLine($"[{connectionId}] Deepgram connection error: {ex.Message}");
-        if (clientWs.State == WebSocketState.Open)
+        // Forward the browser's audio into Flux until the client disconnects. The
+        // frontend sends a {"type":"CloseStream"} text frame for graceful shutdown;
+        // fluxClient.Stop() (in finally) sends the CloseStream control message to Flux.
+        var buffer = new byte[8192];
+        while (clientWs.State == WebSocketState.Open)
         {
-            await clientWs.CloseAsync(
-                WebSocketCloseStatus.InternalServerError,
-                "Deepgram connection error",
-                CancellationToken.None);
+            var result = await clientWs.ReceiveAsync(new ArraySegment<byte>(buffer), appCt);
+            if (result.MessageType == WebSocketMessageType.Close) break;
+
+            if (result.MessageType == WebSocketMessageType.Binary && result.Count > 0)
+            {
+                var chunk = new byte[result.Count];
+                Array.Copy(buffer, chunk, result.Count);
+                fluxClient.Send(chunk);
+            }
+            else if (result.MessageType == WebSocketMessageType.Text)
+            {
+                // The only control message the frontend sends is CloseStream → stop.
+                var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                if (text.Contains("CloseStream")) break;
+            }
         }
     }
     catch (OperationCanceledException)
     {
-        // App shutdown
+        // App shutdown or client disconnect
+    }
+    catch (WebSocketException ex)
+    {
+        Console.Error.WriteLine($"[{connectionId}] WebSocket error: {ex.Message}");
     }
     finally
     {
-        // Close connections if still open
+        try { await fluxClient.Stop(); } catch { }
+        outbound.Writer.TryComplete();
+        try { await pump; } catch { }
+
         if (clientWs.State == WebSocketState.Open)
         {
             try
             {
                 await clientWs.CloseAsync(
-                    WebSocketCloseStatus.NormalClosure,
-                    "Connection ended",
-                    CancellationToken.None);
-            }
-            catch { }
-        }
-        if (deepgramWs.State == WebSocketState.Open)
-        {
-            try
-            {
-                await deepgramWs.CloseAsync(
                     WebSocketCloseStatus.NormalClosure,
                     "Connection ended",
                     CancellationToken.None);
