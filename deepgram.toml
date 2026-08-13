@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/csharp-flux"
 useCase = "flux"
 language = "csharp"
 framework = "dotnet"
-sdk = "6.6.1"
+sdk = "6.9.0"
 tags = ["flux", "streaming", "speech-to-text", "real-time", "turn-detection", "csharp", "dotnet"]
 
 [check]
